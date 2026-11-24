@@ -14,15 +14,14 @@ from model import CNNFieldCausalTransformer
 ROOT = Path(__file__).resolve().parent
 
 
-def load_model(size, weights_path, device):
+def load_model(size, weights_path, device, seed):
+    torch.manual_seed(seed)
     model = CNNFieldCausalTransformer(
         size=size, patch=8, width=32, heads=4, memory_grid=4, history_frames=20
     )
-    weights = torch.load(weights_path, map_location="cpu", weights_only=True)
-    if size != 256:
-        # This deterministic position buffer depends on the token grid.
-        weights["spatial_position"] = model.spatial_position
-    model.load_state_dict(weights, strict=True)
+    if size == 256:
+        weights = torch.load(weights_path, map_location="cpu", weights_only=True)
+        model.load_state_dict(weights, strict=True)
     return model.to(device).eval()
 
 
@@ -53,11 +52,11 @@ def step(model, frame, state):
 
 
 @torch.inference_mode()
-def benchmark(size, args):
+def benchmark(size, args, use_graph):
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
         raise RuntimeError("A CUDA GPU with BF16 support is required")
     device = torch.device("cuda")
-    model = load_model(size, args.weights, device)
+    model = load_model(size, args.weights, device, args.seed)
     frames = load_frames(args.input, args.frame_index, size, device)
     state = None
     for index in range(args.frame_index):
@@ -65,8 +64,21 @@ def benchmark(size, args):
             _, state = model.step(frames[index:index + 1], state)
     frame = frames[args.frame_index:args.frame_index + 1]
 
-    for _ in range(args.warmup):
-        step(model, frame, state)
+    graph = None
+    if use_graph:
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(args.warmup):
+                step(model, frame, state)
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output, _ = step(model, frame, state)
+        graph.replay()
+    else:
+        for _ in range(args.warmup):
+            step(model, frame, state)
     start = torch.cuda.Event(enable_timing=True)
     stop = torch.cuda.Event(enable_timing=True)
     # CUDA events initialize lazily. Prime them outside the timing loop.
@@ -77,7 +89,10 @@ def benchmark(size, args):
     for _ in range(args.runs):
         began = perf_counter()
         start.record()
-        output, _ = step(model, frame, state)
+        if graph is None:
+            output, _ = step(model, frame, state)
+        else:
+            graph.replay()
         stop.record()
         stop.synchronize()
         wall_ms.append((perf_counter() - began) * 1000)
@@ -88,6 +103,9 @@ def benchmark(size, args):
     print(json.dumps({
         "gpu": torch.cuda.get_device_name(),
         "grid_size": size,
+        "mode": "cuda_graph" if use_graph else "eager",
+        "weights": str(args.weights) if size == 256 else "random",
+        "random_seed": args.seed if size != 256 else None,
         "frame_index": args.frame_index,
         "history_frames": args.frame_index,
         "warmup": args.warmup,
@@ -97,16 +115,21 @@ def benchmark(size, args):
     }, indent=2))
 
 
-def main(size):
+def main(size, use_graph=False):
     parser = argparse.ArgumentParser(description=f"Benchmark one {size}x{size} Mamba frame")
     parser.add_argument("--input", type=Path, default=ROOT / "example_input.npz")
-    parser.add_argument("--weights", type=Path, default=ROOT / "weights.pt")
+    if size == 256:
+        parser.add_argument("--weights", type=Path, default=ROOT / "weights.pt")
+    else:
+        parser.set_defaults(weights=None)
+        parser.add_argument("--seed", type=int, default=20261124)
     parser.add_argument("--frame-index", type=int, choices=range(21), default=0,
                         metavar="INDEX", help="zero-based frame index, 0–20")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--runs", type=int, default=50)
     parser.add_argument("--output", type=Path, help="optional output NPZ path")
+    parser.set_defaults(seed=20261124)
     args = parser.parse_args()
     if args.warmup < 1 or args.runs < 1:
         parser.error("--warmup and --runs must be positive")
-    benchmark(size, args)
+    benchmark(size, args, use_graph)
