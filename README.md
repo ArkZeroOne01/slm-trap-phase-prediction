@@ -17,6 +17,34 @@ from predict import predict
 slm_phase = predict("example_input.npz", "weights.pt")
 ```
 
+## 加速：CUDA Graph（可选）
+
+推理是固定的 21 帧因果前向，每帧要启动几十个小算子，耗时主要由启动开销决定。加 `--cuda-graph`（或在 Python 中传 `cuda_graph=True`）会把整段前向捕获成一张 CUDA 图，之后每次调用只做一次重放：
+
+```bash
+python predict.py example_input.npz --weights weights.pt --output prediction.npz --cuda-graph
+```
+
+```python
+slm_phase = predict("example_input.npz", "weights.pt", cuda_graph=True)
+```
+
+RTX 5090、bf16、21 帧 × 96 阱实测：
+
+| 方式 | 每次调用（21 帧） | 每帧 |
+|---|---|---|
+| 默认 | 47.6 ms | 2.27 ms |
+| `--cuda-graph` | 17.2 ms | 0.82 ms |
+
+输出与默认路径逐位相同（同一输入的 `slm_phase` 最大差为 0）。
+
+注意事项：
+
+- 形状需固定（21 帧、96 阱、256 网格，`predict()` 本来就要求这些）。若改用别的序列长度，会按该形状重新捕获一次。
+- 首次带 `cuda_graph=True` 的调用包含捕获开销，之后的调用才会得到上表的数字。
+- 计时请在进程内多次调用取最小值：GPU 空闲时时钟频率很低，单次冷调用会明显偏慢。
+- 同一份 `weights.pt` 只加载一次模型，重复调用不会重复读权重。
+
 ## 输入格式
 
 输入为 NumPy NPZ 文件，包含以下两个 float32 数组：
