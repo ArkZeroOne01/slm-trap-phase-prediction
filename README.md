@@ -69,3 +69,8 @@ RTX 5090、bf16、21 帧 × 96 阱实测：
 ## 输出格式
 
 `prediction.npz` 的 `slm_phase` 为 float32 数组，形状 `[21, 256, 256]`，轴顺序为帧、行、列。数值是 SLM 相位，单位为弧度，范围为 `[0, 2π)`。
+
+
+## 独立 CNN 1024×1024 测速
+
+[`cnn_1024_random_benchmark/`](cnn_1024_random_benchmark/) 提供不加载权重的随机参数 PaperCNN 测速，比较普通推理与 CUDA Graph。该独立程序使用1024×1024输入，不受上方256网格发布模型的限制。运行方法、计时范围与结构复现边界见子目录 README，历史测量见 RESULTS.md。
